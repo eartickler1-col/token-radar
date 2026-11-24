@@ -1,19 +1,22 @@
-// Token Radar (radar-2): a program/v1 entry for token-radar-01 (Node 22, standard library only).
+// Token Radar (radar-3): a program/v1 entry for token-radar-01 (Node 22, standard library only).
 //
-// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores
-// every rankable pre-token protocol with the model in lib/model.ts, and writes the ranked board to
-// /output/board.json. It writes the dashboard's data beside the page as /output/data.js, copies this
-// repository's dashboard/ and screenshots/ to /output, and last writes /output/dossier.json with the
-// vendored make.fun library, so the scorer can rebuild it byte for byte.
+// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits
+// the value model on the snapshot's own live-token comps, scores every rankable pre-token
+// protocol with it, and writes the ranked board to /output/board.json. It writes the
+// dashboard's data beside the page as /output/data.js, copies this repository's dashboard/
+// and screenshots/ to /output, and last writes /output/dossier.json with the vendored
+// make.fun library, so the scorer can rebuild it byte for byte.
 //
-// The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
-// and dashboard/app.js read /output/data.js, which this program writes from the same board, so the
-// page and the board can never disagree. The page recomputes each row's implied value with the same
-// function the model uses, and derives each farm plan from the same record the board does.
+// The dashboard is a static page, no framework and no network: dashboard/index.html,
+// dashboard/app.css and dashboard/app.js read /output/data.js, which this program writes
+// from the same board, so the page and the board can never disagree. The page recomputes
+// each row's implied value with the same function the model uses, and recomputes each farm
+// verdict's arithmetic at any capital and airdrop share.
 //
-// The program is deterministic: same snapshot in, same bytes out, every run. It refuses to write a
-// board the gate would refuse (boardIssue in lib/model.ts), and it refuses to run without three
-// screenshots.
+// The program is deterministic: same snapshot in, same bytes out, every run. The bootstrap
+// rank ranges use a fixed seed, every sort breaks ties by slug, and every fit is plain
+// arithmetic on the snapshot's order. It refuses to write a board the gate would refuse
+// (boardIssue in lib/model.ts), and it refuses to run without three screenshots.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -90,7 +93,10 @@ for (const name of shots) {
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
+const verdicts = { FARM: 0, THIN: 0, SKIP: 0 };
+for (const row of board) verdicts[row.verdict.verdict] += 1;
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.universe.live} live set aside, ${radar.universe.excluded} excluded with reasons)\n` +
+    `token radar: curve log mcap = ${radar.model.curve.a} + ${radar.model.curve.b} log TVL (R2 ${radar.model.curve.r2}, ${radar.model.curve.n_kept}/${radar.model.curve.n_comps} comps); LOO x${radar.model.validation.loo.model_geo} vs flat x${radar.model.validation.loo.flat_geo}; verdicts FARM ${verdicts.FARM} THIN ${verdicts.THIN} SKIP ${verdicts.SKIP}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashboardFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
