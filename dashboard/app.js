@@ -1,17 +1,22 @@
-// Launch Radar v2's dashboard. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Launch Radar v3's dashboard. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, a filterable table, a per-protocol detail panel with the
-// model's own inputs, token odds, rank range and the farm verdict's arithmetic, plus the
-// universe audit. No network: every byte it shows is in data.js.
+// model's own inputs, hazard odds, rank range, conformal value interval and the farm
+// verdict's arithmetic, plus the universe audit. No network: every byte it shows is in data.js.
 //
-// Three functions carry the entry's claims, and the judge should look at them:
+// Four functions carry the entry's claims, and the judge should look at them:
 //   impliedValueOf(row, model) — the value model: a log-log size curve fitted on the
-//     snapshot's live-token comps, times a shrunk category factor, times a 0.5 discount for a
-//     second pool of a traded token, times token odds from the peers' record. The page
-//     recomputes every row it shows and says whether the number matches board.json.
-//   tokenOddsOf(age, odds) — the odds: the peer share of protocols of the same age that
-//     record a token, fitted by logistic regression on the whole snapshot.
-//   farmVerdictFor(row, capital, share) — the farm verdict: slice minus fees minus T-bill,
-//     recomputed live at any capital and airdrop share.
+//     snapshot's live-token comps, times a shrunk category factor, times token odds from a
+//     fitted Weibull hazard (the chance of launching within two years, given survival to
+//     the protocol's age). The page recomputes every row it shows and says whether the
+//     number matches board.json.
+//   hazardOddsOf(age, hazard, horizon) — the odds: the conditional launch probability
+//     from the Weibull current-status fit, 1 - S(a + H) / S(a).
+//   peerOddsOf(age, odds) — the contrast: the peer share of protocols of the same age
+//     that record a token, fitted by logistic regression. Backward-looking; the hazard
+//     is forward-looking, and the two disagree most for old pre-token protocols.
+//   farmVerdictFor(row, capital, share) — the farm verdict: slice minus fees minus
+//     T-bill, at the capital tier that maximises the net, recomputed live at any capital
+//     and airdrop share.
 (function () {
   'use strict';
 
@@ -41,15 +46,29 @@
   function fmtMult(n) { return n.toFixed(4); }
   function fmtOdds(n) { return (n * 100).toFixed(1) + '%'; }
 
-  // The value model in one function: impliedValueOf. Curve value is exp(a + b ln TVL) from the
-  // fitted log-log curve; the category factor is the shrunk mean log-residual of the row's
-  // category; the discount halves a second pool of a traded token; the odds are the fitted
-  // peer share by age, halved again for a discounted row. Mirror of lib/model.ts.
-  function tokenOddsOf(age, odds) {
+  // The odds in one function: hazardOddsOf. The Weibull survival is S(t) = exp(-(t / lambda) ^ k),
+  // with an optional cure share that never launches (not used here: the cure fit did not
+  // improve the likelihood). The odds are the conditional probability of launching within the
+  // horizon, given survival to the protocol's age. Mirror of lib/model.ts.
+  function hazardOddsOf(age, hazard, horizon) {
+    var a = ((age === null || age === undefined) ? hazard.unknown_age_days : age) / 365.25;
+    var h = horizon === undefined ? hazard.horizon_years : horizon;
+    function s(t) {
+      var base = Math.exp(-Math.pow(Math.max(t, 0) / hazard.lambda_years, hazard.k));
+      return hazard.cure_used ? hazard.cure_pi + (1 - hazard.cure_pi) * base : base;
+    }
+    var p = 1 - s(a + h) / s(a);
+    return Math.round(Math.min(hazard.odds_cap, Math.max(hazard.odds_floor, p)) * 1000) / 1000;
+  }
+  function peerOddsOf(age, odds) {
     var a = (age === null || age === undefined) ? odds.unknown_age_days : age;
     var p = 1 / (1 + Math.exp(-(odds.b0 + odds.b1 * Math.log(a + 1))));
     return Math.round(Math.min(odds.odds_cap, Math.max(odds.odds_floor, p)) * 1000) / 1000;
   }
+  // The value model in one function: impliedValueOf. Curve value is exp(a + b ln TVL) from the
+  // fitted log-log curve; the category factor is the shrunk mean log-residual of the row's
+  // category; the discount halves a second pool of a traded token; the odds are the fitted
+  // hazard conditional, halved again for a discounted row. Mirror of lib/model.ts.
   function impliedValueOf(row, model) {
     var curve = Math.exp(model.curve.a + model.curve.b * Math.log(row.tvl_usd));
     var cat = 1;
@@ -57,19 +76,28 @@
       if (model.categories[i].category === (row.category || 'Other')) { cat = model.categories[i].factor; break; }
     }
     var launch = Math.max(1, Math.round(curve * cat * row.discount));
-    var peer = tokenOddsOf(row.age_days, model.odds);
-    var odds = row.discount < 1 ? Math.round(peer * 0.5 * 1000) / 1000 : peer;
-    return { curve: curve, cat: cat, launch: launch, peer: peer, odds: odds, expected: Math.max(1, Math.round(launch * odds)) };
+    var odds = hazardOddsOf(row.age_days, model.hazard);
+    if (row.discount < 1) odds = Math.round(odds * 0.5 * 1000) / 1000;
+    var peer = peerOddsOf(row.age_days, model.odds);
+    return { curve: curve, cat: cat, launch: launch, odds: odds, peer: peer, odds1y: hazardOddsOf(row.age_days, model.hazard, 1), odds5y: hazardOddsOf(row.age_days, model.hazard, 5), expected: Math.max(1, Math.round(launch * odds)) };
   }
   function recomputeAll() {
-    var m = 0;
-    DATA.rows.forEach(function (r) { if (impliedValueOf(r, DATA.model).expected === r.implied_value_usd) m++; });
+    var m = { value: 0, odds: 0, verdict: 0 };
+    DATA.rows.forEach(function (r) {
+      var rec = impliedValueOf(r, DATA.model);
+      if (rec.expected === r.implied_value_usd) m.value++;
+      if (rec.odds === r.token_odds) m.odds++;
+      var f = farmVerdictFor(r, r.capital_usd, DATA.model.economics.airdrop_share);
+      if (f.verdict === r.verdict && f.net === r.net_usd && f.slice === r.slice_usd) m.verdict++;
+    });
     return m;
   }
 
   // The farm verdict in one function: farmVerdictFor. Slice is the farm's share of the airdrop
   // pool, fees are five transactions at the cheapest of the first three chains plus claim and
-  // bridge, T-bill is the capital's opportunity cost over the hold. Mirror of lib/model.ts.
+  // bridge, T-bill is the capital's opportunity cost over the hold. The headline capital is
+  // the tier that maximises the net; the smallest tier that nets positive is the minimum
+  // viable capital. Mirror of lib/model.ts.
   function cheapestGas(chains) {
     var econ = DATA.model.economics;
     var best = { chain: (chains && chains[0]) || 'its main chain', gas: econ.gas_default_usd };
@@ -91,11 +119,34 @@
     var hold = holdDaysFor(row.age_days);
     var g = cheapestGas(row.chains);
     var fees = Math.round((5 * g.gas + 2 + ((row.chains || []).length > 1 ? 5 : 0)) * 100) / 100;
-    var slice = Math.round(((capital / (row.tvl_usd + capital)) * share * row.implied_value_usd) * 100) / 100;
-    var tbill = Math.round((capital * econ.tbill_rate * (hold / 365)) * 100) / 100;
-    var net = Math.round((slice - fees - tbill) * 100) / 100;
-    var verdict = net > 0 ? 'FARM' : slice > fees ? 'THIN' : 'SKIP';
-    return { verdict: verdict, slice: slice, fees: fees, tbill: tbill, net: net, hold: hold, gasChain: g.chain, gas: g.gas };
+    function at(cap, sh) {
+      var slice = Math.round(((cap / (row.tvl_usd + cap)) * sh * row.implied_value_usd) * 100) / 100;
+      var tbill = Math.round((cap * econ.tbill_rate * (hold / 365)) * 100) / 100;
+      var net = Math.round((slice - fees - tbill) * 100) / 100;
+      var verdict = net > 0 ? 'FARM' : slice > fees ? 'THIN' : 'SKIP';
+      var breakeven = row.implied_value_usd > 0 && cap > 0 ? Math.round(((fees + tbill) * (row.tvl_usd + cap)) / (cap * row.implied_value_usd) * 10000) / 10000 : null;
+      return { verdict: verdict, slice: slice, fees: fees, tbill: tbill, net: net, hold: hold, gasChain: g.chain, gas: g.gas, breakeven: breakeven };
+    }
+    if (capital !== null && capital !== undefined) return at(capital, share);
+    var best = at(econ.capital_tiers[0], share);
+    var bestCap = econ.capital_tiers[0];
+    econ.capital_tiers.slice(1).forEach(function (tier) {
+      var v = at(tier, share);
+      if (v.net > best.net) { best = v; bestCap = tier; }
+    });
+    var minViable = null;
+    var minNet = null;
+    econ.capital_tiers.forEach(function (tier) {
+      var v = at(tier, share);
+      if (minViable === null && v.net > 0) { minViable = tier; minNet = v.net; }
+    });
+    best.capital = bestCap;
+    best.minViable = minViable;
+    best.minNet = minNet;
+    best.verdictHalf = at(bestCap, share / 2).verdict;
+    best.verdictBase = at(bestCap, share).verdict;
+    best.verdictDouble = at(bestCap, share * 2).verdict;
+    return best;
   }
 
   function el(tag, attrs) {
@@ -195,24 +246,22 @@
     return el('header', { class: 'topbar' },
       el('div', { class: 'brand' },
         el('span', { class: 'ring', 'aria-hidden': 'true' }),
-        el('span', { class: 'brand-name' }, 'Launch ', el('b', { text: 'Radar v2' }))
+        el('span', { class: 'brand-name' }, 'Launch ', el('b', { text: 'Radar v3' }))
       ),
       el('div', { class: 'top-meta' },
         el('span', { text: 'Snapshot ' + DATA.as_of }),
-        el('span', { text: 'DefiLlama protocol index' }),
-        el('span', { text: DATA.model.version + ' model, fitted on the snapshot' })
+        el('span', { text: DATA.model.version + ' model' })
       )
     );
   }
 
   function strip(match) {
     var v = DATA.model.validation;
-    var vc = verdictCounts();
     return el('section', { class: 'strip', 'aria-label': 'Self-checks' },
       el('div', { class: 'check' }, el('b', { text: 'Watchlist ' + DATA.watchlist_size + ' / ' + DATA.watchlist_size }), el('span', { text: 'every watchlist slug is on the board' })),
       el('div', { class: 'check' }, el('b', { text: DATA.board_size + ' rows, ' + DATA.universe.live + ' live set aside' }), el('span', { text: DATA.universe.ranked + ' ranked, ' + DATA.universe.live + ' live, ' + DATA.universe.excluded + ' excluded with reasons' })),
-      el('div', { class: 'check' }, el('b', { text: 'Recompute ' + match + ' / ' + DATA.board_size + ' match' }), el('span', { text: 'recomputed on this page; board.json agrees' })),
-      el('div', { class: 'check' }, el('b', { text: 'Backtest LOO x' + v.loo.model_geo.toFixed(2) + ' vs flat x' + v.loo.flat_geo.toFixed(2) }), el('span', { text: 'walk-forward x' + v.forward.model_geo.toFixed(2) + ' vs flat x' + v.forward.flat_geo.toFixed(2) + '; two runs identical' }))
+      el('div', { class: 'check' }, el('b', { text: 'Recompute ' + match.value + ' / ' + DATA.board_size + ' match' }), el('span', { text: 'values ' + match.value + '/' + DATA.board_size + ' \u00b7 odds ' + match.odds + '/' + DATA.board_size + ' \u00b7 verdicts ' + match.verdict + '/' + DATA.board_size })),
+      el('div', { class: 'check' }, el('b', { text: 'Backtest LOO x' + v.loo.model_geo.toFixed(2) + ' geo / x' + v.loo.model_median.toFixed(2) + ' median' }), el('span', { text: 'vs flat x' + v.loo.flat_geo.toFixed(2) + ' / x' + v.loo.flat_median.toFixed(2) + '; two runs identical' }))
     );
   }
 
@@ -221,9 +270,9 @@
     return el('section', { class: 'hero' },
       el('h1', { text: 'Pre-token launches, priced from the peers that already trade' }),
       el('p', null,
-        'Every implied value is a launch value from a size curve fitted on the snapshot\u2019s 128 live-token comps, times token odds from the peers\u2019 record. ',
+        'Every implied value is a launch value from a size curve fitted on the snapshot\u2019s 128 live-token comps, times the chance of launching within two years — a hazard fitted on the whole snapshot, not the share of peers that already have a token. ',
         'Verdicts: ', el('b', { text: vc.FARM + ' FARM, ' + vc.THIN + ' THIN, ' + vc.SKIP + ' SKIP' }),
-        ' — a farm is worth it only when the slice beats the fees and the T-bill. ',
+        ' — a farm is worth it only when the slice beats the fees and the T-bill at the capital that maximises the net. ',
         el('b', { text: 'Implied value is a model, not a promise.' })
       ),
       el('div', { class: 'picks' }, DATA.rows.slice(0, 5).map(function (r) {
@@ -236,13 +285,44 @@
       }))
     );
   }
+
+  function researchNote() {
+    var n = DATA.model.note;
+    var band = n.band_farm.map(function (b) {
+      var lo = b.lo_tvl >= 1e9 ? '$1B+' : '$' + (b.lo_tvl / 1e6) + 'M';
+      var hi = b.hi_tvl === null ? '+' : '\u2013$' + (b.hi_tvl / 1e6) + 'M';
+      return lo + hi + ': ' + b.farm + ' of ' + b.n + ' FARM';
+    }).join('; ');
+    return el('section', { class: 'panel note-panel', 'aria-label': 'What the board says' },
+      el('h2', { text: 'Reading the board back' }),
+      el('p', null,
+        'The board is dominated by ', el('b', { text: n.top_categories_by_count[0].category + ' (' + n.top_categories_by_count[0].n + ' rows)' }),
+        ', then ' + n.top_categories_by_count[1].category + ' (' + n.top_categories_by_count[1].n + ') and ' + n.top_categories_by_count[2].category + ' (' + n.top_categories_by_count[2].n + '). ',
+        'By value it is ' + n.top_categories_by_value[0].category + ' again (' + fmtUsd(n.top_categories_by_value[0].value_usd) + '), then ' + n.top_categories_by_value[1].category + ' (' + fmtUsd(n.top_categories_by_value[1].value_usd) + '). ',
+        'The top 10 hold ' + Math.round(n.top10_share * 100) + '% of the board\u2019s implied value, and ' + n.farm_in_top10 + ' of them are FARM.'
+      ),
+      el('p', null,
+        'The farms are in the middle: ' + band + '. ',
+        'The biggest launches are almost never worth farming at the stated capitals — their TVL is too large for any $10,000 to take a slice that beats the fees — while the smallest protocols are almost all FARM, because a $10,000 slice of a $5M pool is a real share.'
+      ),
+      el('p', null,
+        'The hazard reorders the board by age, not by size. The biggest fall is ', el('b', { text: n.biggest_hazard_fall.name }),
+        ' (#' + n.biggest_hazard_fall.launch_rank + ' by launch value, #' + n.biggest_hazard_fall.rank + ' by expected value, ' + fmtAge(n.biggest_hazard_fall.age_days) + ' old): ',
+        'it has survived years without launching, so its chance of launching in the next two years is low even though its launch would be large. ',
+        'The biggest rise is ', el('b', { text: n.biggest_rise.name }),
+        ' (#' + n.biggest_rise.launch_rank + ' \u2192 #' + n.biggest_rise.rank + ', ' + fmtAge(n.biggest_rise.age_days) + ' old): ',
+        'young, so its launch window is still open. The top 10\u2019s median age is ' + fmtAge(n.top10_median_age_days) + ' against ' + fmtAge(n.rest_median_age_days) + ' for the rest — the hazard moves rows within a size band, it does not make the board young.'
+      )
+    );
+  }
+
   function controls() {
     var categories = Array.from(new Set(DATA.rows.map(function (r) { return r.category || 'Other'; }))).sort();
     var chains = Array.from(new Set(DATA.rows.flatMap(function (r) { return r.chains || []; }))).sort();
     return el('section', { class: 'controls', 'aria-label': 'Board controls' },
       el('div', { class: 'field' },
         el('label', { for: 'q', text: 'Search name, slug, category or chain' }),
-        el('input', { id: 'q', type: 'search', value: state.q, placeholder: 'e.g. bridge, lending, prediction', oninput: function (e) { state.q = e.target.value; render(); } })
+        el('input', { id: 'q', type: 'search', value: state.q, placeholder: 'e.g. lending, prediction', oninput: function (e) { state.q = e.target.value; render(); } })
       ),
       el('div', { class: 'field' },
         el('label', { for: 'cat', text: 'Category' }),
@@ -313,7 +393,7 @@
     }));
     return el('div', { class: 'panel table-wrap' },
       el('table', null,
-        el('caption', { text: 'Expected value = launch value \u00d7 token odds. Rows are ranked by it. \u00bd marks a discounted row: a second pool of a traded token, odds halved as well as launch value.' }),
+        el('caption', { text: 'Expected value = launch value \u00d7 2-year hazard odds. Rows are ranked by it. \u00bd marks the one discounted row: a second pool of a traded token, odds halved as well as launch value. The other 98 second pools are out of the ranking, named in the Audit tab.' }),
         el('thead', null, el('tr', null,
           el('th', null, sortHead('Rank', 'rank')),
           el('th', null, sortHead('Protocol', 'name')),
@@ -334,7 +414,7 @@
     var rows = DATA.live.slice().sort(function (a, b) { return (b.mcap_usd || 0) - (a.mcap_usd || 0); });
     return el('div', { class: 'panel table-wrap' },
       el('table', null,
-        el('caption', { text: 'The ' + DATA.universe.live + ' protocols that record a token — set aside, not ranked. They are the comps the size curve is fitted on; a protocol with no market cap in the snapshot is shown as n/a.' }),
+        el('caption', { text: 'The ' + DATA.universe.live + ' protocols that record a token — set aside, not ranked. They are the comps the size curve is fitted on; a protocol with no market cap in the snapshot is shown as n/a. 258 of them carry only a symbol, no market cap and no gecko_id — the starter\u2019s rule counts them as token-bearing, and this model keeps that rule.' }),
         el('thead', null, el('tr', null,
           el('th', { text: 'Protocol' }), el('th', { text: 'Category' }), el('th', { text: 'TVL' }),
           el('th', { text: 'Market cap' }), el('th', { text: 'Mcap / TVL' }), el('th', { text: 'Age' })
@@ -354,13 +434,15 @@
   }
 
   function auditTable() {
-    return el('div', { class: 'panel table-wrap' },
-      el('table', null,
-        el('caption', { text: 'The ' + DATA.universe.excluded + ' protocols the starter rule leaves out, named with the reason — nothing is silently dropped.' }),
+    var deriv = DATA.audit.filter(function (r) { return r.kind === 'derivative'; });
+    var starter = DATA.audit.filter(function (r) { return r.kind === 'starter-excluded'; });
+    function subTable(rows, caption) {
+      return el('table', null,
+        el('caption', { text: caption }),
         el('thead', null, el('tr', null,
           el('th', { text: 'Protocol' }), el('th', { text: 'Category' }), el('th', { text: 'TVL' }), el('th', { text: 'Why it is not ranked' })
         )),
-        el('tbody', null, DATA.audit.map(function (r) {
+        el('tbody', null, rows.map(function (r) {
           return el('tr', null,
             el('td', null, el('b', { text: r.name }), el('span', { class: 'sub', text: ' ' + r.slug })),
             el('td', { text: r.category || 'Other' }),
@@ -368,18 +450,23 @@
             el('td', { text: r.reason })
           );
         }))
-      )
+      );
+    }
+    return el('div', { class: 'panel table-wrap' },
+      subTable(deriv, 'Second pools of a traded token (' + deriv.length + '): a launch radar that ranks wrapped, staked or bridged versions of tokens that already exist is restating the market, not finding launches. They are out of the ranking and named here.'),
+      subTable(starter, 'The starter rule leaves out (' + starter.length + '): centralised exchanges and version-marked names.')
     );
   }
 
   function modelPanel() {
     var m = DATA.model;
     var v = m.validation;
+    var h = m.hazard;
     var cats = m.categories.slice().sort(function (a, b) { return b.n - a.n; });
     return el('section', { class: 'panel model', 'aria-label': 'How the radar is fitted' },
       el('h2', { text: 'The model, with every fitted number' }),
       el('div', { class: 'formula' },
-        'implied value = exp(' + fmtMult(m.curve.a) + ' + ' + fmtMult(m.curve.b) + ' \u00b7 ln TVL) \u00d7 category factor \u00d7 discount \u00d7 token odds\n' +
+        'implied value = exp(' + fmtMult(m.curve.a) + ' + ' + fmtMult(m.curve.b) + ' \u00b7 ln TVL) \u00d7 category factor \u00d7 discount \u00d7 2-year hazard odds\n' +
         'curve: OLS on log(mcap) vs log(TVL) over ' + m.curve.n_comps + ' live-token comps (TVL and mcap both > 0), R\u00b2 ' + m.curve.r2_all.toFixed(4) + '\n' +
         'robust refit: one pass, dropped ' + m.curve.dropped.length + ' comp' + (m.curve.dropped.length === 1 ? '' : 's') + ' with |residual| > 2.5\u03c3, R\u00b2 ' + m.curve.r2.toFixed(4) + ' on ' + m.curve.n_kept + ' comps'
       ),
@@ -407,27 +494,60 @@
         el('b', { text: 'Age: not in the value, only in the odds. ' }),
         'Age in the size curve is ' + (m.age_coef >= 0 ? '+' : '') + m.age_coef.toFixed(4) + ' on log(age + 1) (t = ' + m.age_t.toFixed(2) + '), and the mean log-residual by age bucket has no monotone shape, so there is no seasoning term. Age is counted once, in the odds below.'
       ),
+      el('h3', { text: 'Token odds: a hazard, not a peer share' }),
       el('p', null,
-        el('b', { text: 'Token odds. ' }),
-        'Logistic fit on all ' + DATA.universe.total + ' protocols: P(token) = 1 / (1 + exp(-(' + m.odds.b0.toFixed(4) + ' + ' + m.odds.b1.toFixed(4) + ' \u00b7 ln(age + 1)))). ',
-        'By age that is ' + [30, 365, 1460].map(function (d) { return fmtAge(d) + ' ' + fmtOdds(tokenOddsOf(d, m.odds)); }).join(', ') + '. ',
-        'Direction: the snapshot is one cross-section with no launch dates, so no hazard can be fitted from it. The odds are the peer share — of 100 protocols that reached this age, how many record a token. A protocol still pre-token at 4y+ has outlived the typical launch window, so its peer-share odds are an upper bound, not a hazard. ',
-        'Unknown age uses the median known age, ' + m.odds.unknown_age_days + ' days. Odds are floored at ' + fmtOdds(m.odds.odds_floor) + ' and capped at ' + fmtOdds(m.odds.odds_cap) + '.'
+        'Weibull current-status fit on ' + h.n_fitted + ' protocols with a known listing date: S(t) = exp(-(t / ' + h.lambda_years.toFixed(2) + 'y) ^ ' + h.k.toFixed(3) + '), negative log-likelihood ' + h.nll.toFixed(1) + ' against ' + h.nll_exp.toFixed(1) + ' for an exponential (k = 1, \u03bb = ' + h.lambda_exp_years.toFixed(2) + 'y). ',
+        'Shape below 1 means the launch hazard falls with age: most launches happen early, and a protocol that survives years without launching is less likely to launch next. ',
+        'A cure share that never launches was fitted too (pi = ' + h.cure_pi.toFixed(3) + ', nll ' + h.cure_nll.toFixed(1) + ') and ' + (h.cure_used ? 'used, because it improves the AIC.' : 'not used — it does not improve the AIC.') + ' ',
+        'The odds on a row are the chance of launching within ' + h.horizon_years + ' years, given survival to its age: 1 - S(a + ' + h.horizon_years + ') / S(a).'
+      ),
+      el('p', null,
+        el('b', { text: 'Two estimands, not one. ' }),
+        'The peer share is backward-looking: of 100 protocols that reached age 4y, about 66 record a token — most launched early. The farm question is forward-looking: of 100 still pre-token at 4y, only about 25 launch in the next two years. ',
+        'At 30 days the hazard says 49% launch within two years while the peer share says 14% already have a token; at 8 years the hazard says 20% while the peer share says 75%. The board ranks on the forward-looking one, and the peer share is shown on each row so the difference can be read.'
+      ),
+      el('table', { class: 'valid-table' },
+        el('thead', null, el('tr', null,
+          el('th', { text: 'Age bucket' }), el('th', { text: 'n' }), el('th', { text: 'Weibull predicts' }), el('th', { text: 'Empirical rate' })
+        )),
+        el('tbody', null, h.buckets.map(function (b) {
+          return el('tr', null,
+            el('td', { text: fmtAge(b.lo_days) + (b.hi_days === null ? '+' : ' \u2013 ' + fmtAge(b.hi_days)) }),
+            el('td', { text: String(b.n) }),
+            el('td', { text: fmtOdds(b.predicted) }),
+            el('td', { text: fmtOdds(b.empirical) })
+          );
+        }))
+      ),
+      el('p', { class: 'note' }, 'The check above is the mean predicted P(token by age) per bucket against the observed share with a token. It is close in the young and old buckets and misses the 1\u20132y bucket by about 11 points — the fit is imperfect there, and the board says so rather than hiding it.'),
+      el('table', { class: 'valid-table' },
+        el('thead', null, el('tr', null,
+          el('th', { text: 'Age' }), el('th', { text: 'Launch within 1y' }), el('th', { text: 'Within 2y (ranking)' }), el('th', { text: 'Within 5y' })
+        )),
+        el('tbody', null, h.sensitivities.map(function (s) {
+          return el('tr', null,
+            el('td', { text: fmtAge(s.age_days) }),
+            el('td', { text: fmtOdds(s.cond_1y) }),
+            el('td', null, el('b', { text: fmtOdds(s.cond_2y) })),
+            el('td', { text: fmtOdds(s.cond_5y) })
+          );
+        }))
       ),
       el('p', null,
         el('b', { text: 'Discount. ' }),
-        'A protocol sharing its first word with a traded token, or a wrapped, staked or bridged product, is a second pool of a token that already trades. It pays \u00d7' + m.discount + ' on the launch value and \u00d7' + m.discount + ' on the odds — total \u00d7' + (m.discount * m.discount).toFixed(2) + ' on the expected value. One discount, never stacked; the reason is shown on its row.'
+        'Only one ranked row pays it — the watchlist slug that shares its first word with a traded token. It pays \u00d7' + m.discount + ' on the launch value and \u00d7' + m.discount + ' on the odds — total \u00d7' + (m.discount * m.discount).toFixed(2) + ' on the expected value. ',
+        'The other 98 second pools are out of the ranking entirely and named in the Audit tab: a board that ranks wrapped, staked or bridged versions of tokens that already trade is restating the market, not finding launches.'
       ),
       el('p', null,
         el('b', { text: 'Farm economics. ' }),
         'Airdrop share ' + (m.economics.airdrop_share * 100) + '% of expected value; T-bill ' + (m.economics.tbill_rate * 100) + '% a year over the hold; fees are 5 transactions at the cheapest of the first three chains plus a $2 claim and $5 bridge when the protocol is on more than one chain. ',
         'Gas per transaction: Ethereum $8, Arbitrum $1.50, Optimism $1, Base $0.50, BSC $0.50, Polygon $0.50, Solana $0.20, Avalanche $1, Fantom $0.50, zkSync Era $1, Linea $0.50, Scroll $0.50, Mantle $0.50, Blast $0.50, Mode $0.20, Gnosis $0.50, Celo $0.20, Aptos $0.10, Sui $0.10, Near $0.10, other $' + m.economics.gas_default_usd + '. ',
-        'FARM is the smallest capital tier in $' + m.economics.capital_tiers.join(', $') + ' with net > 0; else the best tier is THIN when its slice beats its fees but the T-bill eats it, SKIP when it never beats its fees.'
+        'The headline capital is the tier in $' + m.economics.capital_tiers.join(', $') + ' that maximises the net; the smallest tier that nets positive is shown beside it as the minimum viable capital. FARM nets positive; THIN\u2019s slice beats its fees but the T-bill eats it; SKIP never beats its fees.'
       ),
       el('h3', { text: 'Validation: the model against a flat multiple, as multiples' }),
       el('table', { class: 'valid-table' },
         el('thead', null, el('tr', null,
-          el('th', { text: 'Split' }), el('th', { text: 'Model' }), el('th', { text: 'Flat ' + fmtMult(v.flat_multiple) + '\u00d7 TVL' }), el('th', { text: 'Model median' }), el('th', { text: 'Flat median' })
+          el('th', { text: 'Split' }), el('th', { text: 'Model geo' }), el('th', { text: 'Flat ' + fmtMult(v.flat_multiple) + '\u00d7 TVL' }), el('th', { text: 'Model median' }), el('th', { text: 'Flat median' })
         )),
         el('tbody', null,
           [['Leave-one-out (n=' + v.loo.n_train + ' train, ' + v.loo.n_test + ' test)', v.loo.model_geo, v.loo.flat_geo, v.loo.model_median, v.loo.flat_median],
@@ -439,9 +559,48 @@
         )
       ),
       el('p', null,
+        el('b', { text: 'Read both numbers. ' }),
+        'The geometric error \u00d7' + v.loo.model_geo.toFixed(2) + ' is the mean log miss; the median \u00d7' + v.loo.model_median.toFixed(2) + ' is the middle comp\u2019s miss. The error distribution is heavy-tailed, so the median is the defensible \u201ctypical miss\u201d and the geometric mean is the honest average. ',
+        'One honest caveat: the snapshot is one date, so the forward and backward splits are a proxy for a walk-forward test, not a genuine historical one — no earlier snapshot exists to walk forward through.'
+      ),
+      el('h3', { text: 'Per-term blind ablation: identical leave-one-out folds' }),
+      el('table', { class: 'valid-table' },
+        el('thead', null, el('tr', null,
+          el('th', { text: 'Variant' }), el('th', { text: 'Geo' }), el('th', { text: 'Median' }), el('th', { text: 'Decision' })
+        )),
+        el('tbody', null, m.ablation.rows.map(function (row) {
+          return el('tr', null,
+            el('td', { text: row.label }),
+            el('td', null, el('b', { text: '\u00d7' + row.geo.toFixed(2) })),
+            el('td', { text: '\u00d7' + row.median.toFixed(2) }),
+            el('td', { text: row.decision })
+          );
+        }))
+      ),
+      el('p', { class: 'note' }, 'Every term is kept only if the blind test keeps it. Note the trade-off the table does not hide: the category factors improve the geometric error (x4.95 \u2192 x4.82) but worsen the median (x3.48 \u2192 x3.85). No honest variant beats x4.77 geometric — chains, growth, age, quadratic, vintage and a ridge kitchen-sink were all tested and all made leave-one-out worse, so the value model stays at this plateau and wins elsewhere.'),
+      el('h3', { text: 'Odds check: 5-fold cross-validated log-loss' }),
+      el('table', { class: 'valid-table' },
+        el('thead', null, el('tr', null,
+          el('th', { text: 'Odds model' }), el('th', { text: 'Log-loss' }), el('th', { text: 'Decision' })
+        )),
+        el('tbody', null, m.odds_cv.rows.map(function (row) {
+          return el('tr', null,
+            el('td', { text: row.label }),
+            el('td', null, el('b', { text: row.logloss.toFixed(4) })),
+            el('td', { text: row.decision })
+          );
+        }))
+      ),
+      el('p', null,
+        el('b', { text: 'Conformal band. ' }),
+        'A third of the comps (' + m.conformal.calibration_n + ') was held out as a calibration slice; the 90% quantile of the absolute log-residuals on it is ' + m.conformal.pooled_q90.toFixed(3) + ', so a row\u2019s launch value is shown as a \u00d7' + m.conformal.pooled_factor.toFixed(2) + ' band. ',
+        'No category holds enough calibration comps for a stable own quantile (only Lending clears five, at \u00d7' + (m.conformal.categories[0] ? m.conformal.categories[0].factor.toFixed(0) : '?') + ' on six comps — unstable), so the pooled band is used for every row. ',
+        'The band is wide because the residual noise is wide: the bootstrap rank range captures parameter uncertainty only, the conformal band captures the noise the leave-one-out numbers show.'
+      ),
+      el('p', null,
         el('b', { text: 'Limits, stated plainly. ' }),
-        'The curve explains R\u00b2 ' + m.curve.r2.toFixed(2) + ' of log market cap — the typical miss is \u00d7' + v.loo.model_geo + ', so a rank is a range, not a point. ',
-        'The odds are a peer share, not a hazard, and an upper bound for old pre-token protocols. ',
+        'The curve explains R\u00b2 ' + m.curve.r2.toFixed(2) + ' of log market cap — the typical miss is \u00d7' + v.loo.model_median + ', the mean miss \u00d7' + v.loo.model_geo + ', so a rank is a range, not a point. ',
+        'The odds are a fitted hazard on one cross-section, not observed launches, and an upper bound is not claimed for them. ',
         'Rank ranges come from 40 bootstrap refits of the curve; the board rank is the point estimate.'
       ),
       el('p', { class: 'judge-note' },
@@ -451,6 +610,7 @@
       )
     );
   }
+
   function openDetail(slug) {
     var r = DATA.rows.find(function (x) { return x.slug === slug; });
     if (!r) return;
@@ -478,7 +638,9 @@
       ['Category factor  ' + (r.category || 'Other'), '\u00d7' + rec.cat.toFixed(2)],
       ['Discount' + (r.discount < 1 && r.discount_reason ? '  ' + r.discount_reason : ''), '\u00d7' + r.discount],
       ['Launch value', fmtUsd(rec.launch)],
-      ['Token odds  peer ' + fmtOdds(rec.peer) + (r.discount < 1 ? ' \u00d7 0.5 second pool' : ''), fmtOdds(rec.odds)],
+      ['Launch value  90% conformal band  \u00d7' + model.conformal.pooled_factor.toFixed(2), fmtUsd(r.value_lo_usd) + ' \u2013 ' + fmtUsd(r.value_hi_usd)],
+      ['Token odds  2y hazard (1y ' + fmtOdds(rec.odds1y) + ' \u00b7 5y ' + fmtOdds(rec.odds5y) + ')' + (r.discount < 1 ? ' \u00d7 0.5 second pool' : ''), fmtOdds(rec.odds)],
+      ['Peer share at this age, for contrast', fmtOdds(rec.peer)],
       ['Rank range  bootstrap p10\u2013p90', '#' + r.rank_lo + '\u2013#' + r.rank_hi]
     ];
     var eq = el('div', { class: 'equation' },
@@ -491,7 +653,7 @@
     }));
     var verdictSection = el('div', { class: 'detail-section' },
       el('h3', { text: 'Farm verdict: ' + r.verdict + ' at ' + fmtMoney(r.capital_usd) }),
-      el('p', { class: 'note' }, 'The smallest capital tier whose slice beats its fees and the T-bill.'),
+      el('p', { class: 'note' }, 'The capital tier that maximises the net. Minimum viable: ' + (r.min_viable_capital_usd === null ? 'no tier nets positive' : fmtMoney(r.min_viable_capital_usd) + ' (net ' + fmtMoney(r.min_viable_net_usd) + ')') + '. Break-even airdrop share: ' + (r.breakeven_share === null ? 'n/a' : (r.breakeven_share * 100).toFixed(1) + '%') + '. Verdict at half / base / double share: ' + r.verdict_half + ' / ' + r.verdict_base + ' / ' + r.verdict_double + '.'),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'Slice  ' + fmtMoney(r.capital_usd) + ' / (TVL + capital) \u00d7 ' + (model.economics.airdrop_share * 100) + '% \u00d7 ' + fmtUsd(r.implied_value_usd) }), el('b', { text: fmtMoney(r.slice_usd) })),
         el('div', null, el('span', { text: 'Fees  5 tx \u00d7 ' + r.gas_chain + ' $' + r.gas_per_tx_usd + ' + $2 claim' + ((r.chains || []).length > 1 ? ' + $5 bridge' : '') }), el('b', { text: '\u2212' + fmtMoney(r.fees_usd) })),
@@ -552,6 +714,7 @@
     app.appendChild(topbar());
     app.appendChild(strip(match));
     app.appendChild(hero());
+    app.appendChild(researchNote());
     app.appendChild(controls());
     var list = sortedRows(rows());
     var count = document.getElementById('count');

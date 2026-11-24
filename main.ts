@@ -1,4 +1,4 @@
-// Token Radar (radar-3): a program/v1 entry for token-radar-01 (Node 22, standard library only).
+// Token Radar (radar-4): a program/v1 entry for token-radar-01 (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits
 // the value model on the snapshot's own live-token comps, scores every rankable pre-token
@@ -14,9 +14,10 @@
 // verdict's arithmetic at any capital and airdrop share.
 //
 // The program is deterministic: same snapshot in, same bytes out, every run. The bootstrap
-// rank ranges use a fixed seed, every sort breaks ties by slug, and every fit is plain
-// arithmetic on the snapshot's order. It refuses to write a board the gate would refuse
-// (boardIssue in lib/model.ts), and it refuses to run without three screenshots.
+// rank ranges and the conformal split use fixed seeds, every sort breaks ties by slug, and
+// every fit is plain arithmetic on the snapshot's order. It refuses to write a board the
+// gate would refuse (boardIssue in lib/model.ts), and it refuses to run without three
+// screenshots.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -96,7 +97,7 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 const verdicts = { FARM: 0, THIN: 0, SKIP: 0 };
 for (const row of board) verdicts[row.verdict.verdict] += 1;
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.universe.live} live set aside, ${radar.universe.excluded} excluded with reasons)\n` +
-    `token radar: curve log mcap = ${radar.model.curve.a} + ${radar.model.curve.b} log TVL (R2 ${radar.model.curve.r2}, ${radar.model.curve.n_kept}/${radar.model.curve.n_comps} comps); LOO x${radar.model.validation.loo.model_geo} vs flat x${radar.model.validation.loo.flat_geo}; verdicts FARM ${verdicts.FARM} THIN ${verdicts.THIN} SKIP ${verdicts.SKIP}\n` +
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.universe.live} live set aside, ${radar.universe.derivatives} derivatives and ${radar.universe.starter_excluded} starter-excluded named in the audit)\n` +
+    `token radar: curve log mcap = ${radar.model.curve.a} + ${radar.model.curve.b} log TVL (R2 ${radar.model.curve.r2}, ${radar.model.curve.n_kept}/${radar.model.curve.n_comps} comps); hazard Weibull k=${radar.model.hazard.k} lambda=${radar.model.hazard.lambda_years}y (nll ${radar.model.hazard.nll} vs exp ${radar.model.hazard.nll_exp}, cure ${radar.model.hazard.cure_used ? `used pi=${radar.model.hazard.cure_pi}` : 'not used'}); LOO x${radar.model.validation.loo.model_geo} geo / x${radar.model.validation.loo.model_median} median vs flat x${radar.model.validation.loo.flat_geo} / x${radar.model.validation.loo.flat_median}; verdicts FARM ${verdicts.FARM} THIN ${verdicts.THIN} SKIP ${verdicts.SKIP}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashboardFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
